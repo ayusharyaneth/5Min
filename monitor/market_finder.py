@@ -1,7 +1,7 @@
 import logging
+import asyncio
 from typing import Dict, List, Optional, Any, Callable
 from datetime import datetime
-import asyncio
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,89 @@ class MarketFinder:
                 logger.error(f"Failed to load TelegramNotifier: {e}")
                 self._telegram_notifier = None
         return self._external_notifier or self._telegram_notifier
+
+    def find_active_btc_5m_markets(self) -> List[Dict]:
+        """
+        Find active Bitcoin 5-minute prediction markets.
+        Returns list of market dictionaries with market_id, symbol, expiry, etc.
+        """
+        markets = []
+        
+        try:
+            # Try to get from CLOB if available
+            if self.clob and hasattr(self.clob, 'get_active_markets'):
+                try:
+                    all_markets = self.clob.get_active_markets()
+                    # Filter for BTC 5m markets
+                    markets = [
+                        m for m in all_markets 
+                        if m.get('base_asset', '').upper() in ['BTC', 'bitcoin', 'XBT']
+                        and '5m' in m.get('timeframe', '').lower()
+                        or m.get('duration') == 300  # 5 minutes in seconds
+                    ]
+                    logger.info(f"Found {len(markets)} BTC 5m markets from CLOB")
+                    return markets
+                except Exception as e:
+                    logger.error(f"Error fetching from CLOB: {e}")
+            
+            # Try store if CLOB failed or unavailable
+            if self.store and hasattr(self.store, 'get_markets'):
+                try:
+                    all_markets = self.store.get_markets(
+                        filters={'base_asset': 'BTC', 'timeframe': '5m', 'status': 'active'}
+                    )
+                    markets = all_markets
+                    logger.info(f"Found {len(markets)} BTC 5m markets from store")
+                    return markets
+                except Exception as e:
+                    logger.error(f"Error fetching from store: {e}")
+            
+            # Fallback: Return empty list or mock data for testing
+            logger.warning("No CLOB or store available for market discovery, returning empty list")
+            return []
+            
+        except Exception as e:
+            logger.error(f"Error in find_active_btc_5m_markets: {e}")
+            return []
+    
+    def find_active_eth_5m_markets(self) -> List[Dict]:
+        """Find active Ethereum 5-minute markets (convenience method)"""
+        markets = []
+        
+        try:
+            # Try to get from CLOB if available
+            if self.clob and hasattr(self.clob, 'get_active_markets'):
+                try:
+                    all_markets = self.clob.get_active_markets()
+                    # Filter for ETH 5m markets
+                    markets = [
+                        m for m in all_markets 
+                        if m.get('base_asset', '').upper() in ['ETH', 'ethereum', 'ETHER']
+                        and ('5m' in m.get('timeframe', '').lower() or m.get('duration') == 300)
+                    ]
+                    logger.info(f"Found {len(markets)} ETH 5m markets from CLOB")
+                    return markets
+                except Exception as e:
+                    logger.error(f"Error fetching ETH markets from CLOB: {e}")
+            
+            # Try store if CLOB failed or unavailable
+            if self.store and hasattr(self.store, 'get_markets'):
+                try:
+                    all_markets = self.store.get_markets(
+                        filters={'base_asset': 'ETH', 'timeframe': '5m', 'status': 'active'}
+                    )
+                    markets = all_markets
+                    logger.info(f"Found {len(markets)} ETH 5m markets from store")
+                    return markets
+                except Exception as e:
+                    logger.error(f"Error fetching ETH markets from store: {e}")
+            
+            logger.warning("No CLOB or store available for ETH market discovery, returning empty list")
+            return []
+            
+        except Exception as e:
+            logger.error(f"Error in find_active_eth_5m_markets: {e}")
+            return []
 
     def find_opportunities(self, symbols: List[str], 
                           min_confidence: float = 0.7,
