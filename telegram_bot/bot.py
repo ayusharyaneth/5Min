@@ -221,10 +221,12 @@ Available commands:
             self.running = True
             logger.info("Telegram bot initialized in thread")
             
-            # Run the bot (this blocks until stop())
+            # CRITICAL FIX: Disable signal handlers to avoid "main thread" error
+            # stop_signals=None prevents signal registration which only works in main thread
             self.application.run_polling(
                 drop_pending_updates=True,
-                close_loop=False
+                close_loop=False,
+                stop_signals=None  # This fixes: set_wakeup_fd only works in main thread
             )
             
         except Exception as e:
@@ -232,15 +234,21 @@ Available commands:
         finally:
             self.running = False
             if self._loop:
-                self._loop.close()
+                try:
+                    self._loop.close()
+                except Exception:
+                    pass
 
     def stop(self):
         """Stop the bot gracefully"""
-        if self.application:
-            asyncio.run_coroutine_threadsafe(
-                self.application.stop(), 
-                self._loop
-            )
+        if self.application and self._loop:
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self.application.stop(), 
+                    self._loop
+                )
+            except Exception as e:
+                logger.error(f"Error stopping bot: {e}")
         self.running = False
         logger.info("Telegram bot stopped")
 
