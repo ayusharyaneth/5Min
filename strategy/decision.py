@@ -1,6 +1,6 @@
 """Trading decision logic."""
 from dataclasses import dataclass
-from typing import list
+from typing import List
 
 from strategy.position import Position
 from strategy.trend import detect_trend
