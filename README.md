@@ -147,32 +147,6 @@ Once the bot is running, control it from your Telegram account:
 
 ---
 
-## Requirements
-
-```
-python-dotenv==1.0.0
-requests==2.31.0
-websocket-client==1.6.4
-eth-account==0.10.0
-web3==6.15.1
-pydantic==2.5.3
-python-dateutil==2.8.2
-python-telegram-bot==20.7
-```
-
----
-
-## Prerequisites
-
-- Python **3.10+**
-- A funded Polymarket wallet with API credentials → [polymarket.com](https://polymarket.com)
-- A Telegram bot → create one via [@BotFather](https://t.me/botfather)
-- Two Telegram channels (logs + trades) with the bot added as admin
-
----
-
-<div align="center">
-
 **⚠️ Disclaimer**
 
 This project is for educational and research purposes only.  
@@ -181,6 +155,9 @@ Use at your own risk.
 
 ---
 
+
+<div align="center">
+  
 Made with ☕ by [ayusharyaneth](https://github.com/ayusharyaneth)
 
 </div>
