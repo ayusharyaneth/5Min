@@ -1,7 +1,7 @@
 import logging
 import asyncio
 import threading
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -16,18 +16,11 @@ class TelegramBotRunner:
                  db: Any = None,
                  store: Any = None,
                  paper_executor: Any = None,
+                 market_finder: Any = None,
+                 closure_checker: Any = None,
                  **kwargs):
         """
-        Initialize Telegram Bot Runner with dependency injection
-        
-        Args:
-            token: Telegram bot API token
-            config: Configuration dictionary
-            dashboard: Dashboard instance for UI updates
-            db: Database connection
-            store: Data persistence layer
-            paper_executor: Paper trading executor reference
-            **kwargs: Additional arguments for extensibility
+        Initialize Telegram Bot Runner with full dependency injection
         """
         self.token = token
         self.config = config or {}
@@ -35,8 +28,9 @@ class TelegramBotRunner:
         self.db = db
         self.store = store
         self.paper_executor = paper_executor
+        self.market_finder = market_finder
+        self.closure_checker = closure_checker
         
-        # Handle any extra kwargs
         for key, value in kwargs.items():
             setattr(self, key, value)
             
@@ -45,8 +39,14 @@ class TelegramBotRunner:
         self._loop = None
         self._thread = None
         
+        # Log what we have
+        logger.info(f"Bot initialized with: "
+                   f"paper_executor={paper_executor is not None}, "
+                   f"market_finder={market_finder is not None}, "
+                   f"dashboard={dashboard is not None}")
+
     def register_handlers(self):
-        """Register command handlers"""
+        """Register all command handlers"""
         handlers = [
             CommandHandler("start", self.cmd_start),
             CommandHandler("status", self.cmd_status),
@@ -69,133 +69,327 @@ class TelegramBotRunner:
         logger.info(f"Registered {len(handlers)} command handlers")
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("🤖 Bot started! Use /help for commands.")
+        """Welcome message with system status"""
+        welcome_text = (
+            "🤖 <b>5Min Trading Bot Started</b>\n\n"
+            f"Paper Trading: {'✅ Active' if self.paper_executor else '❌ Not Connected'}\n"
+            f"Market Finder: {'✅ Active' if self.market_finder else '❌ Not Connected'}\n"
+            f"Closure Monitor: {'✅ Active' if self.closure_checker else '❌ Not Connected'}\n\n"
+            "Use /help for available commands"
+        )
+        await update.message.reply_text(welcome_text, parse_mode='HTML')
 
     async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show system status including dashboard if available"""
-        status_text = "✅ System operational"
+        """Show detailed system status"""
+        status_lines = ["📊 <b>System Status</b>"]
         
-        if self.dashboard and hasattr(self.dashboard, 'get_status'):
+        # Check Paper Executor
+        if self.paper_executor:
             try:
-                dash_status = self.dashboard.get_status()
-                status_text += f"\nDashboard: {dash_status}"
+                portfolio = self.paper_executor.get_portfolio_value() if hasattr(self.paper_executor, 'get_portfolio_value') else None
+                if portfolio:
+                    status_lines.append(
+                        f"💰 Balance: ${portfolio.get('total_value', 0):,.2f} "
+                        f"({'🟢' if portfolio.get('total_return', 0) >= 0 else '🔴'} "
+                        f"${portfolio.get('total_return', 0):,.2f})"
+                    )
+                else:
+                    status_lines.append("💰 Paper Trading: Connected (no data yet)")
             except Exception as e:
-                logger.error(f"Error getting dashboard status: {e}")
-                
-        await update.message.reply_text(status_text)
+                status_lines.append(f"💰 Paper Trading: Error ({str(e)})")
+        else:
+            status_lines.append("❌ Paper Trading: Not initialized")
+        
+        # Check Market Finder
+        if self.market_finder:
+            active_markets = len(self.market_finder.active_monitors) if hasattr(self.market_finder, 'active_monitors') else 0
+            status_lines.append(f"🔍 Market Finder: Connected ({active_markets} monitors)")
+        else:
+            status_lines.append("❌ Market Finder: Not initialized")
+            
+        # Check Closure Checker
+        if self.closure_checker:
+            active = len(self.closure_checker.active_markets) if hasattr(self.closure_checker, 'active_markets') else 0
+            status_lines.append(f"🔒 Closure Checker: Connected ({active} markets watching)")
+        else:
+            status_lines.append("❌ Closure Checker: Not initialized")
+        
+        # Check DB
+        status_lines.append(f"🗄 Database: {'✅ Connected' if self.db else '❌ Not connected'}")
+        
+        await update.message.reply_text("\n".join(status_lines), parse_mode='HTML')
 
     async def cmd_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show balance from paper executor if available"""
-        if self.paper_executor and hasattr(self.paper_executor, 'get_portfolio_value'):
-            try:
-                portfolio = self.paper_executor.get_portfolio_value()
-                balance_text = (
-                    f"💰 Portfolio Status:\n"
-                    f"Cash: ${portfolio.get('cash_balance', 0):,.2f}\n"
-                    f"Positions: ${portfolio.get('positions_value', 0):,.2f}\n"
-                    f"Total: ${portfolio.get('total_value', 0):,.2f}\n"
-                    f"PnL: ${portfolio.get('total_return', 0):,.2f}"
-                )
-                await update.message.reply_text(balance_text)
+        """Show actual balance from paper executor"""
+        if not self.paper_executor:
+            await update.message.reply_text(
+                "❌ <b>Paper Trading not connected</b>\n"
+                "The trading engine is not initialized. Check logs.",
+                parse_mode='HTML'
+            )
+            return
+            
+        try:
+            if not hasattr(self.paper_executor, 'get_portfolio_value'):
+                await update.message.reply_text("❌ Paper executor missing get_portfolio_value method")
                 return
-            except Exception as e:
-                logger.error(f"Error getting balance: {e}")
                 
-        await update.message.reply_text("💰 Balance check...")
+            portfolio = self.paper_executor.get_portfolio_value()
+            
+            balance_text = (
+                f"💰 <b>Portfolio Balance</b>\n\n"
+                f"Cash: <code>${portfolio.get('cash_balance', 0):,.2f}</code>\n"
+                f"Positions Value: <code>${portfolio.get('positions_value', 0):,.2f}</code>\n"
+                f"Total Value: <code>${portfolio.get('total_value', 0):,.2f}</code>\n"
+                f"Initial Balance: <code>${self.paper_executor.initial_balance:,.2f}</code>\n\n"
+                f"Unrealized PnL: {'🟢' if portfolio.get('unrealized_pnl', 0) >= 0 else '🔴'} "
+                f"<code>${portfolio.get('unrealized_pnl', 0):,.2f}</code>\n"
+                f"Total Return: {'🟢' if portfolio.get('total_return', 0) >= 0 else '🔴'} "
+                f"<code>${portfolio.get('total_return', 0):,.2f} ({portfolio.get('return_pct', 0):.2f}%)</code>"
+            )
+            await update.message.reply_text(balance_text, parse_mode='HTML')
+            
+        except Exception as e:
+            logger.error(f"Balance error: {e}")
+            await update.message.reply_text(f"❌ Error fetching balance: {str(e)}")
 
     async def cmd_positions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show open positions"""
-        if self.paper_executor and hasattr(self.paper_executor, 'positions'):
-            try:
-                positions = self.paper_executor.positions
-                if not positions:
-                    await update.message.reply_text("📊 No open positions")
-                    return
-                    
-                pos_text = "📊 Open Positions:\n"
-                for symbol, pos in positions.items():
-                    pos_text += f"{symbol}: {pos.get('quantity', 0)} @ ${pos.get('avg_entry_price', 0):.2f}\n"
-                await update.message.reply_text(pos_text)
+        """Show actual open positions"""
+        if not self.paper_executor:
+            await update.message.reply_text("❌ Paper Trading not connected")
+            return
+            
+        try:
+            positions = getattr(self.paper_executor, 'positions', {})
+            
+            if not positions:
+                await update.message.reply_text("📭 <b>No open positions</b>\nAll markets settled or no trades yet.", parse_mode='HTML')
                 return
-            except Exception as e:
-                logger.error(f"Error getting positions: {e}")
+            
+            pos_lines = ["📊 <b>Open Positions</b>\n"]
+            
+            for symbol, pos in positions.items():
+                qty = pos.get('quantity', 0)
+                avg_price = pos.get('avg_entry_price', 0)
+                current_price = 0
                 
-        await update.message.reply_text("📊 Positions check...")
+                # Try to get current price if method exists
+                if hasattr(self.paper_executor, '_get_market_price'):
+                    try:
+                        current_price = self.paper_executor._get_market_price(symbol)
+                    except:
+                        pass
+                
+                # Calculate PnL for this position
+                if qty > 0 and current_price > 0:
+                    pnl = (current_price - avg_price) * qty
+                    pnl_emoji = '🟢' if pnl >= 0 else '🔴'
+                    pos_lines.append(
+                        f"<b>{symbol}</b>\n"
+                        f"  Size: {qty}\n"
+                        f"  Avg Entry: ${avg_price:,.2f}\n"
+                        f"  Current: ${current_price:,.2f}\n"
+                        f"  {pnl_emoji} PnL: ${pnl:,.2f}\n"
+                    )
+                else:
+                    pos_lines.append(
+                        f"<b>{symbol}</b>\n"
+                        f"  Size: {qty}\n"
+                        f"  Avg Entry: ${avg_price:,.2f}\n"
+                    )
+            
+            await update.message.reply_text("\n".join(pos_lines), parse_mode='HTML')
+            
+        except Exception as e:
+            logger.error(f"Positions error: {e}")
+            await update.message.reply_text(f"❌ Error fetching positions: {str(e)}")
 
     async def cmd_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show trade history"""
-        if self.paper_executor and hasattr(self.paper_executor, 'get_trade_history'):
-            try:
+        """Show actual trade history"""
+        if not self.paper_executor:
+            await update.message.reply_text("❌ Paper Trading not connected")
+            return
+            
+        try:
+            # Get last 5 trades
+            history = []
+            if hasattr(self.paper_executor, 'get_trade_history'):
                 history = self.paper_executor.get_trade_history(limit=5)
-                if not history:
-                    await update.message.reply_text("📜 No recent trades")
-                    return
-                    
-                hist_text = "📜 Recent Trades:\n"
-                for trade in history:
-                    hist_text += f"{trade.get('symbol')} {trade.get('side')} @ ${trade.get('price', 0):.2f}\n"
-                await update.message.reply_text(hist_text)
+            elif hasattr(self.paper_executor, 'trade_history'):
+                history = self.paper_executor.trade_history[-5:]
+            
+            if not history:
+                await update.message.reply_text("📜 <b>No trade history yet</b>\nTrades will appear here once executed.", parse_mode='HTML')
                 return
-            except Exception as e:
-                logger.error(f"Error getting history: {e}")
+            
+            hist_lines = ["📜 <b>Recent Trades</b>\n"]
+            
+            for trade in history:
+                side = trade.get('side', 'UNKNOWN')
+                emoji = '🟢' if side == 'BUY' else '🔴' if side == 'SELL' else '⚪'
                 
-        await update.message.reply_text("📜 History check...")
+                hist_lines.append(
+                    f"{emoji} <b>{trade.get('symbol', 'Unknown')}</b> {side}\n"
+                    f"   Size: {trade.get('size', 0)}\n"
+                    f"   Price: ${trade.get('price', 0):,.2f}\n"
+                    f"   Total: ${trade.get('total_value', 0):,.2f}\n"
+                    f"   Time: {trade.get('timestamp', 'Unknown')}\n"
+                )
+            
+            await update.message.reply_text("\n".join(hist_lines), parse_mode='HTML')
+            
+        except Exception as e:
+            logger.error(f"History error: {e}")
+            await update.message.reply_text(f"❌ Error fetching history: {str(e)}")
+
+    async def cmd_pnl(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show P&L summary"""
+        if not self.paper_executor:
+            await update.message.reply_text("❌ Paper Trading not connected")
+            return
+            
+        try:
+            if not hasattr(self.paper_executor, 'get_portfolio_value'):
+                await update.message.reply_text("❌ Method not available")
+                return
+                
+            portfolio = self.paper_executor.get_portfolio_value()
+            total_return = portfolio.get('total_return', 0)
+            return_pct = portfolio.get('return_pct', 0)
+            
+            pnl_text = (
+                f"📈 <b>P&L Summary</b>\n\n"
+                f"Total Return: {'🟢' if total_return >= 0 else '🔴'} ${total_return:,.2f}\n"
+                f"Return %: {'🟢' if return_pct >= 0 else '🔴'} {return_pct:.2f}%\n\n"
+                f"Unrealized PnL: ${portfolio.get('unrealized_pnl', 0):,.2f}\n"
+                f"Realized PnL: ${portfolio.get('realized_pnl', 0):,.2f}\n"
+                f"Total Trades: {len(getattr(self.paper_executor, 'trade_history', []))}"
+            )
+            await update.message.reply_text(pnl_text, parse_mode='HTML')
+            
+        except Exception as e:
+            logger.error(f"PnL error: {e}")
+            await update.message.reply_text(f"❌ Error calculating PnL: {str(e)}")
+
+    async def cmd_trade(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show trade execution panel with current market info"""
+        if not self.paper_executor:
+            await update.message.reply_text("❌ Paper Trading not connected")
+            return
+            
+        try:
+            # Get available balance
+            portfolio = self.paper_executor.get_portfolio_value() if hasattr(self.paper_executor, 'get_portfolio_value') else {}
+            balance = portfolio.get('cash_balance', 0)
+            
+            trade_text = (
+                f"💱 <b>Trade Execution</b>\n\n"
+                f"Available Balance: <code>${balance:,.2f}</code>\n\n"
+                f"To place a trade, use format:\n"
+                f"<code>/buy SYMBOL SIZE</code> or <code>/sell SYMBOL SIZE</code>\n\n"
+                f"Example: <code>/buy BTC-USD 0.5</code>\n\n"
+                f"Active Markets: Use /markets to see available symbols"
+            )
+            await update.message.reply_text(trade_text, parse_mode='HTML')
+            
+        except Exception as e:
+            await update.message.reply_text(f"💱 Trade panel error: {str(e)}")
+
+    async def cmd_markets(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show active markets from market_finder"""
+        markets_text = ["📊 <b>Active Markets</b>\n"]
+        
+        # Try to get from market_finder
+        if self.market_finder and hasattr(self.market_finder, 'find_active_btc_5m_markets'):
+            try:
+                btc_markets = self.market_finder.find_active_btc_5m_markets()
+                if btc_markets:
+                    markets_text.append(f"\n<b>BTC 5m Markets ({len(btc_markets)} found):</b>")
+                    for m in btc_markets[:5]:  # Show max 5
+                        markets_text.append(f"• {m.get('symbol', m.get('market_id', 'Unknown'))}")
+                else:
+                    markets_text.append("\n<i>No BTC 5m markets currently active</i>")
+            except Exception as e:
+                markets_text.append(f"\n<i>Error loading markets: {str(e)}</i>")
+        else:
+            markets_text.append("\n<i>Market finder not connected</i>")
+        
+        # Show closure checker status
+        if self.closure_checker and hasattr(self.closure_checker, 'get_active_markets'):
+            try:
+                active = self.closure_checker.get_active_markets()
+                markets_text.append(f"\n<b>Markets Being Monitored:</b> {len(active)}")
+                if active:
+                    for m in active[:3]:
+                        markets_text.append(f"• {m}")
+            except:
+                pass
+        
+        await update.message.reply_text("\n".join(markets_text), parse_mode='HTML')
+
+    async def cmd_alert(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show and set price alerts"""
+        alert_text = (
+            "🔔 <b>Alert Settings</b>\n\n"
+            f"Notification Status: {'✅ Enabled' if self.config.get('notifications_enabled', True) else '❌ Disabled'}\n"
+            f"Chat ID: <code>{self.config.get('chat_id', 'Not set')}</code>\n\n"
+            "Commands:\n"
+            "/alert on - Enable notifications\n"
+            "/alert off - Disable notifications"
+        )
+        await update.message.reply_text(alert_text, parse_mode='HTML')
+
+    async def cmd_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show bot settings"""
+        settings_text = (
+            "⚙️ <b>Bot Configuration</b>\n\n"
+            f"Auto-Trade: {'✅ ON' if self.config.get('auto_trade', False) else '❌ OFF'}\n"
+            f"Default Trade Size: {self.config.get('default_trade_size', 'Not set')}\n"
+            f"Check Interval: {self.config.get('check_interval', '60')}s\n"
+            f"Notifications: {'✅ ON' if self.config.get('notifications_enabled', True) else '❌ OFF'}\n\n"
+            f"Connected Components:\n"
+            f"  Paper Executor: {'✅' if self.paper_executor else '❌'}\n"
+            f"  Market Finder: {'✅' if self.market_finder else '❌'}\n"
+            f"  Closure Checker: {'✅' if self.closure_checker else '❌'}\n"
+            f"  Database: {'✅' if self.db else '❌'}"
+        )
+        await update.message.reply_text(settings_text, parse_mode='HTML')
+
+    async def cmd_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Stop the bot"""
+        await update.message.reply_text("🛑 <b>Stopping bot...</b>\nGoodbye!", parse_mode='HTML')
+        self.stop()
+
+    async def cmd_restart(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Restart command"""
+        await update.message.reply_text("🔄 <b>Restarting...</b>\nPlease wait.", parse_mode='HTML')
+        # In a real implementation, you'd trigger a restart here
 
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show help"""
         help_text = """
-Available commands:
-/start - Start the bot
-/status - Check system status
-/balance - Check balance
+<b>📱 Available Commands</b>
+
+<b>Account Info:</b>
+/balance - Show cash balance & portfolio value
 /positions - View open positions
-/history - View trade history
-/pnl - View P&L summary
-/trade - Execute manual trade
+/history - Recent trade history
+/pnl - Profit & Loss summary
+
+<b>Trading:</b>
 /markets - List active markets
-/alert - Set price alert
-/settings - Bot settings
+/trade - Trade execution panel
+/alert - Alert settings
+
+<b>System:</b>
+/status - System health check
+/settings - Bot configuration
+/start - Start message
 /stop - Stop the bot
 /restart - Restart bot
 /help - Show this help
         """
-        await update.message.reply_text(help_text)
-
-    async def cmd_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("🛑 Stopping bot...")
-        self.stop()
-
-    async def cmd_pnl(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show P&L summary"""
-        if self.paper_executor and hasattr(self.paper_executor, 'get_portfolio_value'):
-            try:
-                portfolio = self.paper_executor.get_portfolio_value()
-                pnl_text = (
-                    f"📈 P&L Summary:\n"
-                    f"Total Return: ${portfolio.get('total_return', 0):,.2f}\n"
-                    f"Return %: {portfolio.get('return_pct', 0):.2f}%\n"
-                    f"Unrealized PnL: ${portfolio.get('unrealized_pnl', 0):,.2f}"
-                )
-                await update.message.reply_text(pnl_text)
-                return
-            except Exception as e:
-                logger.error(f"Error getting PnL: {e}")
-                
-        await update.message.reply_text("📈 P&L Summary...")
-
-    async def cmd_trade(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("💱 Trade execution panel...")
-
-    async def cmd_markets(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("📊 Active markets...")
-
-    async def cmd_alert(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("🔔 Alert settings...")
-
-    async def cmd_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("⚙️ Current settings...")
-
-    async def cmd_restart(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("🔄 Restarting...")
+        await update.message.reply_text(help_text, parse_mode='HTML')
 
     def start(self):
         """Start the bot in a separate thread with its own event loop"""
@@ -210,27 +404,24 @@ Available commands:
     def _run(self):
         """Internal run method that creates event loop and runs bot"""
         try:
-            # Create new event loop for this thread
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
             
-            # Build application
             self.application = Application.builder().token(self.token).build()
             self.register_handlers()
             
             self.running = True
-            logger.info("Telegram bot initialized in thread")
+            logger.info("Telegram bot initialized and polling...")
             
-            # CRITICAL FIX: Disable signal handlers to avoid "main thread" error
-            # stop_signals=None prevents signal registration which only works in main thread
+            # CRITICAL: stop_signals=None prevents main thread error
             self.application.run_polling(
                 drop_pending_updates=True,
                 close_loop=False,
-                stop_signals=None  # This fixes: set_wakeup_fd only works in main thread
+                stop_signals=None
             )
             
         except Exception as e:
-            logger.error(f"Telegram bot error: {e}")
+            logger.error(f"Telegram bot fatal error: {e}")
         finally:
             self.running = False
             if self._loop:
@@ -250,7 +441,6 @@ Available commands:
             except Exception as e:
                 logger.error(f"Error stopping bot: {e}")
         self.running = False
-        logger.info("Telegram bot stopped")
 
     def send_message_sync(self, chat_id: int, message: str):
         """Send message synchronously from other threads"""
@@ -259,7 +449,6 @@ Available commands:
             return
             
         try:
-            # Create coroutine and run it in the bot's event loop
             async def _send():
                 await self.application.bot.send_message(
                     chat_id=chat_id, 
@@ -268,12 +457,11 @@ Available commands:
                 )
             
             future = asyncio.run_coroutine_threadsafe(_send(), self._loop)
-            future.result(timeout=10)  # Wait for result
+            future.result(timeout=10)
             
         except Exception as e:
             logger.error(f"Failed to send message: {e}")
 
-    # Async methods for internal use
     async def send_message(self, chat_id: int, message: str):
         """Async method to send message"""
         if self.application:
@@ -284,13 +472,12 @@ Available commands:
             )
 
     async def send_trade_notification(self, trade: Dict):
-        """Send trade notification to configured chat"""
+        """Send trade notification"""
         if not self.config.get('notifications_enabled', True):
             return
             
         chat_id = self.config.get('chat_id')
         if not chat_id:
-            logger.warning("No chat_id configured for notifications")
             return
             
         message = (
@@ -298,7 +485,7 @@ Available commands:
             f"Symbol: {trade.get('symbol')}\n"
             f"Side: {trade.get('side')}\n"
             f"Size: {trade.get('size')}\n"
-            f"Price: ${trade.get('price', 0):.2f}"
+            f"Price: ${trade.get('price', 0):,.2f}"
         )
         
         await self.send_message(chat_id, message)
