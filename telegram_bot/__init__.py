@@ -1,6 +1,3 @@
-"""Telegram bot module for notifications and commands."""
+# telegram_bot/__init__.py
 from telegram_bot.notifier import TelegramNotifier
-from telegram_bot.dashboard import Dashboard
-from telegram_bot.bot import TelegramBotRunner
-
-__all__ = ["TelegramNotifier", "Dashboard", "TelegramBotRunner"]
+from telegram_bot.dashboard import Dashboard  # <-- This causes the circle
