@@ -2,8 +2,8 @@ import logging
 import asyncio
 import threading
 from typing import Optional, Dict, Any, List
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 
 logger = logging.getLogger(__name__)
 
@@ -39,14 +39,14 @@ class TelegramBotRunner:
         self._loop = None
         self._thread = None
         
-        # Log what we have
         logger.info(f"Bot initialized with: "
                    f"paper_executor={paper_executor is not None}, "
                    f"market_finder={market_finder is not None}, "
                    f"dashboard={dashboard is not None}")
 
     def register_handlers(self):
-        """Register all command handlers"""
+        """Register all command handlers and callback handlers"""
+        # Command handlers
         handlers = [
             CommandHandler("start", self.cmd_start),
             CommandHandler("status", self.cmd_status),
@@ -65,8 +65,19 @@ class TelegramBotRunner:
         
         for handler in handlers:
             self.application.add_handler(handler)
-            
-        logger.info(f"Registered {len(handlers)} command handlers")
+        
+        # CRITICAL: Add callback query handlers for refresh buttons
+        self.application.add_handler(CallbackQueryHandler(self.refresh_balance_callback, pattern="^refresh_balance$"))
+        self.application.add_handler(CallbackQueryHandler(self.refresh_history_callback, pattern="^refresh_history$"))
+        self.application.add_handler(CallbackQueryHandler(self.refresh_pnl_callback, pattern="^refresh_pnl$"))
+        self.application.add_handler(CallbackQueryHandler(self.refresh_status_callback, pattern="^refresh_status$"))
+        
+        logger.info(f"Registered {len(handlers)} command handlers and 4 refresh callbacks")
+
+    def get_refresh_markup(self, callback_data: str) -> InlineKeyboardMarkup:
+        """Create refresh button markup"""
+        keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data=callback_data)]]
+        return InlineKeyboardMarkup(keyboard)
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Welcome message with system status"""
@@ -79,8 +90,8 @@ class TelegramBotRunner:
         )
         await update.message.reply_text(welcome_text, parse_mode='HTML')
 
-    async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show detailed system status"""
+    async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False):
+        """Show detailed system status with refresh button"""
         status_lines = ["📊 <b>System Status</b>"]
         
         # Check Paper Executor
@@ -117,21 +128,40 @@ class TelegramBotRunner:
         # Check DB
         status_lines.append(f"🗄 Database: {'✅ Connected' if self.db else '❌ Not connected'}")
         
-        await update.message.reply_text("\n".join(status_lines), parse_mode='HTML')
+        text = "\n".join(status_lines)
+        markup = self.get_refresh_markup("refresh_status")
+        
+        if edit and update.callback_query:
+            await update.callback_query.edit_message_text(text, parse_mode='HTML', reply_markup=markup)
+        else:
+            await update.message.reply_text(text, parse_mode='HTML', reply_markup=markup)
 
-    async def cmd_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show actual balance from paper executor"""
+    async def refresh_status_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle refresh button click for status"""
+        query = update.callback_query
+        await query.answer("Refreshing status...")  # Show loading popup
+        await self.cmd_status(update, context, edit=True)
+
+    async def cmd_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False):
+        """Show actual balance from paper executor with refresh button"""
         if not self.paper_executor:
-            await update.message.reply_text(
+            text = (
                 "❌ <b>Paper Trading not connected</b>\n"
-                "The trading engine is not initialized. Check logs.",
-                parse_mode='HTML'
+                "The trading engine is not initialized. Check logs."
             )
+            if edit and update.callback_query:
+                await update.callback_query.edit_message_text(text, parse_mode='HTML')
+            else:
+                await update.message.reply_text(text, parse_mode='HTML')
             return
             
         try:
             if not hasattr(self.paper_executor, 'get_portfolio_value'):
-                await update.message.reply_text("❌ Paper executor missing get_portfolio_value method")
+                text = "❌ Paper executor missing get_portfolio_value method"
+                if edit and update.callback_query:
+                    await update.callback_query.edit_message_text(text, parse_mode='HTML')
+                else:
+                    await update.message.reply_text(text, parse_mode='HTML')
                 return
                 
             portfolio = self.paper_executor.get_portfolio_value()
@@ -147,14 +177,30 @@ class TelegramBotRunner:
                 f"Total Return: {'🟢' if portfolio.get('total_return', 0) >= 0 else '🔴'} "
                 f"<code>${portfolio.get('total_return', 0):,.2f} ({portfolio.get('return_pct', 0):.2f}%)</code>"
             )
-            await update.message.reply_text(balance_text, parse_mode='HTML')
+            
+            markup = self.get_refresh_markup("refresh_balance")
+            
+            if edit and update.callback_query:
+                await update.callback_query.edit_message_text(balance_text, parse_mode='HTML', reply_markup=markup)
+            else:
+                await update.message.reply_text(balance_text, parse_mode='HTML', reply_markup=markup)
             
         except Exception as e:
             logger.error(f"Balance error: {e}")
-            await update.message.reply_text(f"❌ Error fetching balance: {str(e)}")
+            text = f"❌ Error fetching balance: {str(e)}"
+            if edit and update.callback_query:
+                await update.callback_query.edit_message_text(text, parse_mode='HTML')
+            else:
+                await update.message.reply_text(text, parse_mode='HTML')
+
+    async def refresh_balance_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle refresh button click for balance"""
+        query = update.callback_query
+        await query.answer("Refreshing balance...")  # Show loading popup
+        await self.cmd_balance(update, context, edit=True)
 
     async def cmd_positions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show actual open positions"""
+        """Show open positions"""
         if not self.paper_executor:
             await update.message.reply_text("❌ Paper Trading not connected")
             return
@@ -173,14 +219,12 @@ class TelegramBotRunner:
                 avg_price = pos.get('avg_entry_price', 0)
                 current_price = 0
                 
-                # Try to get current price if method exists
                 if hasattr(self.paper_executor, '_get_market_price'):
                     try:
                         current_price = self.paper_executor._get_market_price(symbol)
                     except:
                         pass
                 
-                # Calculate PnL for this position
                 if qty > 0 and current_price > 0:
                     pnl = (current_price - avg_price) * qty
                     pnl_emoji = '🟢' if pnl >= 0 else '🔴'
@@ -204,14 +248,17 @@ class TelegramBotRunner:
             logger.error(f"Positions error: {e}")
             await update.message.reply_text(f"❌ Error fetching positions: {str(e)}")
 
-    async def cmd_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show actual trade history"""
+    async def cmd_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False):
+        """Show trade history with refresh button"""
         if not self.paper_executor:
-            await update.message.reply_text("❌ Paper Trading not connected")
+            text = "❌ Paper Trading not connected"
+            if edit and update.callback_query:
+                await update.callback_query.edit_message_text(text, parse_mode='HTML')
+            else:
+                await update.message.reply_text(text, parse_mode='HTML')
             return
             
         try:
-            # Get last 5 trades
             history = []
             if hasattr(self.paper_executor, 'get_trade_history'):
                 history = self.paper_executor.get_trade_history(limit=5)
@@ -219,7 +266,12 @@ class TelegramBotRunner:
                 history = self.paper_executor.trade_history[-5:]
             
             if not history:
-                await update.message.reply_text("📜 <b>No trade history yet</b>\nTrades will appear here once executed.", parse_mode='HTML')
+                text = "📜 <b>No trade history yet</b>\nTrades will appear here once executed."
+                markup = self.get_refresh_markup("refresh_history")
+                if edit and update.callback_query:
+                    await update.callback_query.edit_message_text(text, parse_mode='HTML', reply_markup=markup)
+                else:
+                    await update.message.reply_text(text, parse_mode='HTML', reply_markup=markup)
                 return
             
             hist_lines = ["📜 <b>Recent Trades</b>\n"]
@@ -236,21 +288,45 @@ class TelegramBotRunner:
                     f"   Time: {trade.get('timestamp', 'Unknown')}\n"
                 )
             
-            await update.message.reply_text("\n".join(hist_lines), parse_mode='HTML')
+            markup = self.get_refresh_markup("refresh_history")
+            text = "\n".join(hist_lines)
+            
+            if edit and update.callback_query:
+                await update.callback_query.edit_message_text(text, parse_mode='HTML', reply_markup=markup)
+            else:
+                await update.message.reply_text(text, parse_mode='HTML', reply_markup=markup)
             
         except Exception as e:
             logger.error(f"History error: {e}")
-            await update.message.reply_text(f"❌ Error fetching history: {str(e)}")
+            text = f"❌ Error fetching history: {str(e)}"
+            if edit and update.callback_query:
+                await update.callback_query.edit_message_text(text, parse_mode='HTML')
+            else:
+                await update.message.reply_text(text, parse_mode='HTML')
 
-    async def cmd_pnl(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show P&L summary"""
+    async def refresh_history_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle refresh button click for history"""
+        query = update.callback_query
+        await query.answer("Refreshing history...")  # Show loading popup
+        await self.cmd_history(update, context, edit=True)
+
+    async def cmd_pnl(self, update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False):
+        """Show P&L summary with refresh button"""
         if not self.paper_executor:
-            await update.message.reply_text("❌ Paper Trading not connected")
+            text = "❌ Paper Trading not connected"
+            if edit and update.callback_query:
+                await update.callback_query.edit_message_text(text, parse_mode='HTML')
+            else:
+                await update.message.reply_text(text, parse_mode='HTML')
             return
             
         try:
             if not hasattr(self.paper_executor, 'get_portfolio_value'):
-                await update.message.reply_text("❌ Method not available")
+                text = "❌ Method not available"
+                if edit and update.callback_query:
+                    await update.callback_query.edit_message_text(text, parse_mode='HTML')
+                else:
+                    await update.message.reply_text(text, parse_mode='HTML')
                 return
                 
             portfolio = self.paper_executor.get_portfolio_value()
@@ -265,11 +341,27 @@ class TelegramBotRunner:
                 f"Realized PnL: ${portfolio.get('realized_pnl', 0):,.2f}\n"
                 f"Total Trades: {len(getattr(self.paper_executor, 'trade_history', []))}"
             )
-            await update.message.reply_text(pnl_text, parse_mode='HTML')
+            
+            markup = self.get_refresh_markup("refresh_pnl")
+            
+            if edit and update.callback_query:
+                await update.callback_query.edit_message_text(pnl_text, parse_mode='HTML', reply_markup=markup)
+            else:
+                await update.message.reply_text(pnl_text, parse_mode='HTML', reply_markup=markup)
             
         except Exception as e:
             logger.error(f"PnL error: {e}")
-            await update.message.reply_text(f"❌ Error calculating PnL: {str(e)}")
+            text = f"❌ Error calculating PnL: {str(e)}"
+            if edit and update.callback_query:
+                await update.callback_query.edit_message_text(text, parse_mode='HTML')
+            else:
+                await update.message.reply_text(text, parse_mode='HTML')
+
+    async def refresh_pnl_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle refresh button click for PnL"""
+        query = update.callback_query
+        await query.answer("Refreshing P&L...")  # Show loading popup
+        await self.cmd_pnl(update, context, edit=True)
 
     async def cmd_trade(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show trade execution panel with current market info"""
@@ -278,7 +370,6 @@ class TelegramBotRunner:
             return
             
         try:
-            # Get available balance
             portfolio = self.paper_executor.get_portfolio_value() if hasattr(self.paper_executor, 'get_portfolio_value') else {}
             balance = portfolio.get('cash_balance', 0)
             
@@ -299,13 +390,12 @@ class TelegramBotRunner:
         """Show active markets from market_finder"""
         markets_text = ["📊 <b>Active Markets</b>\n"]
         
-        # Try to get from market_finder
         if self.market_finder and hasattr(self.market_finder, 'find_active_btc_5m_markets'):
             try:
                 btc_markets = self.market_finder.find_active_btc_5m_markets()
                 if btc_markets:
                     markets_text.append(f"\n<b>BTC 5m Markets ({len(btc_markets)} found):</b>")
-                    for m in btc_markets[:5]:  # Show max 5
+                    for m in btc_markets[:5]:
                         markets_text.append(f"• {m.get('symbol', m.get('market_id', 'Unknown'))}")
                 else:
                     markets_text.append("\n<i>No BTC 5m markets currently active</i>")
@@ -314,7 +404,6 @@ class TelegramBotRunner:
         else:
             markets_text.append("\n<i>Market finder not connected</i>")
         
-        # Show closure checker status
         if self.closure_checker and hasattr(self.closure_checker, 'get_active_markets'):
             try:
                 active = self.closure_checker.get_active_markets()
@@ -363,7 +452,6 @@ class TelegramBotRunner:
     async def cmd_restart(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Restart command"""
         await update.message.reply_text("🔄 <b>Restarting...</b>\nPlease wait.", parse_mode='HTML')
-        # In a real implementation, you'd trigger a restart here
 
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show help"""
@@ -371,10 +459,10 @@ class TelegramBotRunner:
 <b>📱 Available Commands</b>
 
 <b>Account Info:</b>
-/balance - Show cash balance & portfolio value
+/balance - Show cash balance & portfolio value ↻
 /positions - View open positions
-/history - Recent trade history
-/pnl - Profit & Loss summary
+/history - Recent trade history ↻
+/pnl - Profit & Loss summary ↻
 
 <b>Trading:</b>
 /markets - List active markets
@@ -382,14 +470,21 @@ class TelegramBotRunner:
 /alert - Alert settings
 
 <b>System:</b>
-/status - System health check
+/status - System health check ↻
 /settings - Bot configuration
 /start - Start message
 /stop - Stop the bot
 /restart - Restart bot
 /help - Show this help
+
+<i>↻ = Has refresh button</i>
         """
         await update.message.reply_text(help_text, parse_mode='HTML')
+
+    def get_refresh_markup(self, callback_data: str) -> InlineKeyboardMarkup:
+        """Helper method to create refresh button"""
+        keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data=callback_data)]]
+        return InlineKeyboardMarkup(keyboard)
 
     def start(self):
         """Start the bot in a separate thread with its own event loop"""
@@ -413,7 +508,6 @@ class TelegramBotRunner:
             self.running = True
             logger.info("Telegram bot initialized and polling...")
             
-            # CRITICAL: stop_signals=None prevents main thread error
             self.application.run_polling(
                 drop_pending_updates=True,
                 close_loop=False,
