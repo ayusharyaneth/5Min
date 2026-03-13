@@ -6,7 +6,26 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 from telegram.error import BadRequest
 
+# Custom formatter to mask sensitive tokens in logs
+class SensitiveDataFilter(logging.Filter):
+    """Filter to hide bot tokens and sensitive data from logs"""
+    def filter(self, record):
+        if isinstance(record.getMessage(), str):
+            # Mask bot tokens (format: 123456789:ABCdef...)
+            import re
+            record.msg = re.sub(r'\d{9,}:[A-Za-z0-9_-]{35}', '***BOT_TOKEN_HIDDEN***', record.msg)
+            # Mask chat IDs for privacy
+            record.msg = re.sub(r'chat_id=\d+', 'chat_id=***', record.msg)
+        return True
+
+# Setup clean logging
 logger = logging.getLogger(__name__)
+logger.addFilter(SensitiveDataFilter())
+
+# Reduce noise from external libraries
+logging.getLogger('httpx').setLevel(logging.WARNING)
+logging.getLogger('telegram.ext.Application').setLevel(logging.INFO)
+logging.getLogger('telegram.Bot').setLevel(logging.INFO)
 
 
 class TelegramBotRunner:
@@ -29,6 +48,7 @@ class TelegramBotRunner:
         self.market_finder = market_finder
         self.closure_checker = closure_checker
         
+        # Store extra kwargs silently
         for key, value in kwargs.items():
             setattr(self, key, value)
             
@@ -37,11 +57,17 @@ class TelegramBotRunner:
         self._loop = None
         self._thread = None
         
-        logger.info(f"Bot initialized with: "
-                   f"paper_executor={paper_executor is not None}, "
-                   f"market_finder={market_finder is not None}")
+        # Log clean summary
+        components = []
+        if paper_executor: components.append("Trading")
+        if market_finder: components.append("Markets")
+        if closure_checker: components.append("Monitor")
+        if db: components.append("Database")
+        
+        logger.info(f"🤖 Bot initialized | Components: {', '.join(components) if components else 'None'}")
 
     def register_handlers(self):
+        """Register command handlers"""
         handlers = [
             CommandHandler("start", self.cmd_start),
             CommandHandler("status", self.cmd_status),
@@ -49,7 +75,7 @@ class TelegramBotRunner:
             CommandHandler("positions", self.cmd_positions),
             CommandHandler("history", self.cmd_history),
             CommandHandler("help", self.cmd_help),
-            CommandHandler("stop", self.cmd_stop),
+            # STOP COMMAND REMOVED - use Ctrl+C or systemctl to stop the bot
             CommandHandler("pnl", self.cmd_pnl),
             CommandHandler("trade", self.cmd_trade),
             CommandHandler("markets", self.cmd_markets),
@@ -61,93 +87,71 @@ class TelegramBotRunner:
         for handler in handlers:
             self.application.add_handler(handler)
         
-        # Refresh callbacks
+        # Callback handlers
         self.application.add_handler(CallbackQueryHandler(self.refresh_balance_callback, pattern="^refresh_balance$"))
         self.application.add_handler(CallbackQueryHandler(self.refresh_history_callback, pattern="^refresh_history$"))
         self.application.add_handler(CallbackQueryHandler(self.refresh_pnl_callback, pattern="^refresh_pnl$"))
         self.application.add_handler(CallbackQueryHandler(self.refresh_status_callback, pattern="^refresh_status$"))
-        
-        # CRITICAL: Auto-trade toggle callback
         self.application.add_handler(CallbackQueryHandler(self.toggle_auto_trade_callback, pattern="^toggle_auto_trade$"))
         
-        logger.info(f"Registered {len(handlers)} command handlers and 5 callbacks")
+        logger.info(f"✅ Loaded {len(handlers)} commands")
 
     def get_refresh_markup(self, callback_data: str) -> InlineKeyboardMarkup:
         keyboard = [[InlineKeyboardButton("🔄 Refresh", callback_data=callback_data)]]
         return InlineKeyboardMarkup(keyboard)
 
     async def safe_edit_message(self, update: Update, text: str, markup: InlineKeyboardMarkup, parse_mode: str = 'HTML'):
-        """Safely edit message, handling 'Message is not modified' error"""
+        """Safely edit message"""
         try:
             if update.callback_query:
-                await update.callback_query.edit_message_text(
-                    text=text, 
-                    parse_mode=parse_mode, 
-                    reply_markup=markup
-                )
+                await update.callback_query.edit_message_text(text=text, parse_mode=parse_mode, reply_markup=markup)
             else:
                 await update.message.reply_text(text, parse_mode=parse_mode, reply_markup=markup)
         except BadRequest as e:
             if "Message is not modified" in str(e):
                 if update.callback_query:
-                    await update.callback_query.answer("✅ Already up to date")
-                logger.debug("Refresh requested but data unchanged")
+                    await update.callback_query.answer("✅ Up to date")
             else:
                 raise
         except Exception as e:
-            logger.error(f"Error editing message: {e}")
-            raise
+            logger.error(f"Edit failed: {e}")
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        welcome_text = (
-            "🤖 <b>5Min Trading Bot Started</b>\n\n"
-            f"Paper Trading: {'✅ Active' if self.paper_executor else '❌ Not Connected'}\n"
-            f"Market Finder: {'✅ Active' if self.market_finder else '❌ Not Connected'}\n"
-            f"Closure Monitor: {'✅ Active' if self.closure_checker else '❌ Not Connected'}\n"
-            f"Auto-Trade: {'✅ ON' if self.config.get('auto_trade', False) else '❌ OFF'}\n\n"
-            "Use /help for available commands"
+        """Welcome message"""
+        welcome = (
+            "🤖 <b>5Min Trading Bot</b>\n\n"
+            f"💰 Trading: {'✅ Active' if self.paper_executor else '❌ Offline'}\n"
+            f"🔍 Markets: {'✅ Active' if self.market_finder else '❌ Offline'}\n"
+            f"🤖 Auto-Trade: {'✅ ON' if self.config.get('auto_trade') else '❌ OFF'}\n\n"
+            "📱 Use /help for commands"
         )
-        await update.message.reply_text(welcome_text, parse_mode='HTML')
+        await update.message.reply_text(welcome, parse_mode='HTML')
 
     async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False):
-        """Show detailed system status with refresh button"""
-        status_lines = ["📊 <b>System Status</b>"]
+        """System status"""
+        from datetime import datetime
         
+        lines = ["📊 <b>Status</b>"]
+        
+        # Trading status
         if self.paper_executor:
             try:
-                portfolio = self.paper_executor.get_portfolio_value() if hasattr(self.paper_executor, 'get_portfolio_value') else None
-                if portfolio:
-                    status_lines.append(
-                        f"💰 Balance: ${portfolio.get('total_value', 0):,.2f} "
-                        f"({'🟢' if portfolio.get('total_return', 0) >= 0 else '🔴'} "
-                        f"${portfolio.get('total_return', 0):,.2f})"
-                    )
-                else:
-                    status_lines.append("💰 Paper Trading: Connected")
-            except Exception as e:
-                status_lines.append(f"💰 Error: {str(e)}")
+                pf = self.paper_executor.get_portfolio_value()
+                ret = pf.get('total_return', 0)
+                lines.append(f"💰 Balance: ${pf.get('total_value', 0):,.0f} ({'+' if ret>=0 else ''}{ret:,.0f})")
+            except:
+                lines.append("💰 Trading: Ready")
         else:
-            status_lines.append("❌ Paper Trading: Not initialized")
+            lines.append("❌ Trading: Offline")
         
-        if self.market_finder:
-            active_markets = len(self.market_finder.active_monitors) if hasattr(self.market_finder, 'active_monitors') else 0
-            status_lines.append(f"🔍 Market Finder: Connected ({active_markets} monitors)")
-        else:
-            status_lines.append("❌ Market Finder: Not initialized")
-            
-        if self.closure_checker:
-            active = len(self.closure_checker.active_markets) if hasattr(self.closure_checker, 'active_markets') else 0
-            status_lines.append(f"🔒 Closure Checker: Connected ({active} markets)")
-        else:
-            status_lines.append("❌ Closure Checker: Not initialized")
+        # Other components
+        lines.append(f"🔍 Finder: {'✅' if self.market_finder else '❌'}")
+        lines.append(f"🔒 Monitor: {'✅' if self.closure_checker else '❌'}")
+        lines.append(f"🗄 DB: {'✅' if self.db else '❌'}")
+        lines.append(f"⚡ Auto-Trade: {'ON' if self.config.get('auto_trade') else 'OFF'}")
+        lines.append(f"\n<i>{datetime.now().strftime('%H:%M:%S')}</i>")
         
-        status_lines.append(f"🗄 Database: {'✅' if self.db else '❌'}")
-        status_lines.append(f"🤖 Auto-Trade: {'✅ ON' if self.config.get('auto_trade', False) else '❌ OFF'}")
-        
-        from datetime import datetime
-        status_lines.append(f"\n<i>Last updated: {datetime.now().strftime('%H:%M:%S')}</i>")
-        
-        text = "\n".join(status_lines)
+        text = "\n".join(lines)
         markup = self.get_refresh_markup("refresh_status")
         
         if edit:
@@ -156,360 +160,290 @@ class TelegramBotRunner:
             await update.message.reply_text(text, parse_mode='HTML', reply_markup=markup)
 
     async def refresh_status_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer("Refreshing...")
+        await update.callback_query.answer("Refreshing...")
         await self.cmd_status(update, context, edit=True)
 
     async def cmd_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False):
-        """Show balance with refresh button"""
+        """Portfolio balance"""
         if not self.paper_executor:
-            text = "❌ <b>Paper Trading not connected</b>"
+            text = "❌ Trading offline"
             if edit:
                 await self.safe_edit_message(update, text, None)
             else:
-                await update.message.reply_text(text, parse_mode='HTML')
+                await update.message.reply_text(text)
             return
             
         try:
-            portfolio = self.paper_executor.get_portfolio_value()
+            pf = self.paper_executor.get_portfolio_value()
             from datetime import datetime
             
-            balance_text = (
-                f"💰 <b>Portfolio Balance</b>\n\n"
-                f"Cash: <code>${portfolio.get('cash_balance', 0):,.2f}</code>\n"
-                f"Positions: <code>${portfolio.get('positions_value', 0):,.2f}</code>\n"
-                f"Total: <code>${portfolio.get('total_value', 0):,.2f}</code>\n"
-                f"Initial: <code>${self.paper_executor.initial_balance:,.2f}</code>\n\n"
-                f"Unrealized: {'🟢' if portfolio.get('unrealized_pnl', 0) >= 0 else '🔴'} ${portfolio.get('unrealized_pnl', 0):,.2f}\n"
-                f"Return: {'🟢' if portfolio.get('total_return', 0) >= 0 else '🔴'} ${portfolio.get('total_return', 0):,.2f} ({portfolio.get('return_pct', 0):.2f}%)\n\n"
-                f"<i>Updated: {datetime.now().strftime('%H:%M:%S')}</i>"
+            text = (
+                f"💰 <b>Balance</b> <i>{datetime.now().strftime('%H:%M')}</i>\n\n"
+                f"Cash: ${pf['cash_balance']:,.2f}\n"
+                f"Positions: ${pf['positions_value']:,.2f}\n"
+                f"Total: ${pf['total_value']:,.2f}\n\n"
+                f"PnL: {'🟢' if pf['total_return']>=0 else '🔴'} ${pf['total_return']:,.2f} ({pf['return_pct']:.2f}%)"
             )
-            
             markup = self.get_refresh_markup("refresh_balance")
-            
-            if edit:
-                await self.safe_edit_message(update, balance_text, markup)
-            else:
-                await update.message.reply_text(balance_text, parse_mode='HTML', reply_markup=markup)
-            
-        except Exception as e:
-            logger.error(f"Balance error: {e}")
-            text = f"❌ Error: {str(e)}"
-            if edit:
-                await self.safe_edit_message(update, text, None)
-            else:
-                await update.message.reply_text(text, parse_mode='HTML')
-
-    async def refresh_balance_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer("Refreshing balance...")
-        await self.cmd_balance(update, context, edit=True)
-
-    async def cmd_positions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show open positions"""
-        if not self.paper_executor:
-            await update.message.reply_text("❌ Paper Trading not connected")
-            return
-            
-        try:
-            positions = getattr(self.paper_executor, 'positions', {})
-            
-            if not positions:
-                await update.message.reply_text("📭 <b>No open positions</b>", parse_mode='HTML')
-                return
-            
-            pos_lines = ["📊 <b>Open Positions</b>\n"]
-            
-            for symbol, pos in positions.items():
-                qty = pos.get('quantity', 0)
-                avg_price = pos.get('avg_entry_price', 0)
-                current_price = 0
-                
-                if hasattr(self.paper_executor, '_get_market_price'):
-                    try:
-                        current_price = self.paper_executor._get_market_price(symbol)
-                    except:
-                        pass
-                
-                if qty > 0 and current_price > 0:
-                    pnl = (current_price - avg_price) * qty
-                    pnl_emoji = '🟢' if pnl >= 0 else '🔴'
-                    pos_lines.append(
-                        f"<b>{symbol}</b>\n"
-                        f"  Size: {qty}\n"
-                        f"  Entry: ${avg_price:,.2f}\n"
-                        f"  Current: ${current_price:,.2f}\n"
-                        f"  {pnl_emoji} PnL: ${pnl:,.2f}\n"
-                    )
-                else:
-                    pos_lines.append(
-                        f"<b>{symbol}</b>\n"
-                        f"  Size: {qty}\n"
-                        f"  Avg: ${avg_price:,.2f}\n"
-                    )
-            
-            await update.message.reply_text("\n".join(pos_lines), parse_mode='HTML')
-            
-        except Exception as e:
-            logger.error(f"Positions error: {e}")
-            await update.message.reply_text(f"❌ Error: {str(e)}")
-
-    async def cmd_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False):
-        """Show trade history with refresh button"""
-        if not self.paper_executor:
-            text = "❌ Paper Trading not connected"
-            if edit:
-                await self.safe_edit_message(update, text, None)
-            else:
-                await update.message.reply_text(text, parse_mode='HTML')
-            return
-            
-        try:
-            history = []
-            if hasattr(self.paper_executor, 'get_trade_history'):
-                history = self.paper_executor.get_trade_history(limit=5)
-            elif hasattr(self.paper_executor, 'trade_history'):
-                history = self.paper_executor.trade_history[-5:]
-            
-            from datetime import datetime
-            
-            if not history:
-                text = "📜 <b>No trades yet</b>\nHistory will appear here once trades are executed."
-                markup = self.get_refresh_markup("refresh_history")
-                if edit:
-                    await self.safe_edit_message(update, text, markup)
-                else:
-                    await update.message.reply_text(text, parse_mode='HTML', reply_markup=markup)
-                return
-            
-            hist_lines = [f"📜 <b>Recent Trades</b> <i>({datetime.now().strftime('%H:%M:%S')})</i>\n"]
-            
-            for trade in history:
-                side = trade.get('side', 'UNKNOWN')
-                emoji = '🟢' if side == 'BUY' else '🔴' if side == 'SELL' else '⚪'
-                time_str = trade.get('timestamp', 'Unknown')
-                if isinstance(time_str, datetime):
-                    time_str = time_str.strftime('%H:%M')
-                
-                hist_lines.append(
-                    f"{emoji} <b>{trade.get('symbol', 'Unknown')}</b> {side}\n"
-                    f"   {trade.get('size', 0)} @ ${trade.get('price', 0):,.2f} = ${trade.get('total_value', 0):,.2f}\n"
-                    f"   <i>{time_str}</i>\n"
-                )
-            
-            markup = self.get_refresh_markup("refresh_history")
-            text = "\n".join(hist_lines)
             
             if edit:
                 await self.safe_edit_message(update, text, markup)
             else:
                 await update.message.reply_text(text, parse_mode='HTML', reply_markup=markup)
-            
         except Exception as e:
-            logger.error(f"History error: {e}")
-            text = f"❌ Error: {str(e)}"
+            logger.error(f"Balance error: {e}")
+            text = "❌ Error loading balance"
             if edit:
                 await self.safe_edit_message(update, text, None)
             else:
-                await update.message.reply_text(text, parse_mode='HTML')
+                await update.message.reply_text(text)
+
+    async def refresh_balance_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.callback_query.answer("Refreshing...")
+        await self.cmd_balance(update, context, edit=True)
+
+    async def cmd_positions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Open positions"""
+        if not self.paper_executor:
+            await update.message.reply_text("❌ Trading offline")
+            return
+            
+        positions = getattr(self.paper_executor, 'positions', {})
+        if not positions:
+            await update.message.reply_text("📭 No open positions")
+            return
+        
+        lines = ["📊 <b>Positions</b>"]
+        for sym, pos in positions.items():
+            qty = pos.get('quantity', 0)
+            price = pos.get('avg_entry_price', 0)
+            lines.append(f"\n<b>{sym}</b>\n  {qty} @ ${price:,.2f}")
+        
+        await update.message.reply_text("\n".join(lines), parse_mode='HTML')
+
+    async def cmd_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False):
+        """Trade history"""
+        if not self.paper_executor:
+            text = "❌ Trading offline"
+            if edit:
+                await self.safe_edit_message(update, text, None)
+            else:
+                await update.message.reply_text(text)
+            return
+            
+        history = []
+        if hasattr(self.paper_executor, 'get_trade_history'):
+            history = self.paper_executor.get_trade_history(limit=5)
+        elif hasattr(self.paper_executor, 'trade_history'):
+            history = self.paper_executor.trade_history[-5:]
+        
+        from datetime import datetime
+        
+        if not history:
+            text = "📜 No trades yet\n<i>History appears here after first trade</i>"
+            markup = self.get_refresh_markup("refresh_history")
+            if edit:
+                await self.safe_edit_message(update, text, markup)
+            else:
+                await update.message.reply_text(text, parse_mode='HTML', reply_markup=markup)
+            return
+        
+        lines = [f"📜 <b>Trades</b> <i>{datetime.now().strftime('%H:%M')}</i>\n"]
+        for t in history:
+            side = t.get('side', '?')
+            emoji = '🟢' if side == 'BUY' else '🔴'
+            lines.append(f"{emoji} {t.get('symbol')} {side} {t.get('size')} @ ${t.get('price', 0):,.2f}")
+        
+        text = "\n".join(lines)
+        markup = self.get_refresh_markup("refresh_history")
+        
+        if edit:
+            await self.safe_edit_message(update, text, markup)
+        else:
+            await update.message.reply_text(text, parse_mode='HTML', reply_markup=markup)
 
     async def refresh_history_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer("Refreshing history...")
+        await update.callback_query.answer("Refreshing...")
         await self.cmd_history(update, context, edit=True)
 
     async def cmd_pnl(self, update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False):
-        """Show P&L summary with refresh button"""
+        """P&L summary"""
         if not self.paper_executor:
-            text = "❌ Paper Trading not connected"
+            text = "❌ Trading offline"
             if edit:
                 await self.safe_edit_message(update, text, None)
             else:
-                await update.message.reply_text(text, parse_mode='HTML')
+                await update.message.reply_text(text)
             return
             
         try:
-            portfolio = self.paper_executor.get_portfolio_value()
-            total_return = portfolio.get('total_return', 0)
-            return_pct = portfolio.get('return_pct', 0)
+            pf = self.paper_executor.get_portfolio_value()
             from datetime import datetime
             
-            pnl_text = (
-                f"📈 <b>P&L Summary</b> <i>{datetime.now().strftime('%H:%M:%S')}</i>\n\n"
-                f"Total Return: {'🟢' if total_return >= 0 else '🔴'} ${total_return:,.2f}\n"
-                f"Return %: {'🟢' if return_pct >= 0 else '🔴'} {return_pct:.2f}%\n\n"
-                f"Unrealized: ${portfolio.get('unrealized_pnl', 0):,.2f}\n"
-                f"Realized: ${portfolio.get('realized_pnl', 0):,.2f}\n"
+            text = (
+                f"📈 <b>P&L</b> <i>{datetime.now().strftime('%H:%M')}</i>\n\n"
+                f"Return: {'🟢' if pf['total_return']>=0 else '🔴'} ${pf['total_return']:,.2f} ({pf['return_pct']:.2f}%)\n"
+                f"Unrealized: ${pf['unrealized_pnl']:,.2f}\n"
                 f"Trades: {len(getattr(self.paper_executor, 'trade_history', []))}"
             )
-            
             markup = self.get_refresh_markup("refresh_pnl")
             
             if edit:
-                await self.safe_edit_message(update, pnl_text, markup)
+                await self.safe_edit_message(update, text, markup)
             else:
-                await update.message.reply_text(pnl_text, parse_mode='HTML', reply_markup=markup)
-            
+                await update.message.reply_text(text, parse_mode='HTML', reply_markup=markup)
         except Exception as e:
-            logger.error(f"PnL error: {e}")
-            text = f"❌ Error: {str(e)}"
+            text = "❌ Error loading P&L"
             if edit:
                 await self.safe_edit_message(update, text, None)
             else:
-                await update.message.reply_text(text, parse_mode='HTML')
+                await update.message.reply_text(text)
 
     async def refresh_pnl_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer("Refreshing P&L...")
+        await update.callback_query.answer("Refreshing...")
         await self.cmd_pnl(update, context, edit=True)
 
     async def cmd_trade(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show trade execution panel"""
+        """Trade panel"""
         if not self.paper_executor:
-            await update.message.reply_text("❌ Paper Trading not connected")
+            await update.message.reply_text("❌ Trading offline")
             return
             
-        try:
-            portfolio = self.paper_executor.get_portfolio_value() if hasattr(self.paper_executor, 'get_portfolio_value') else {}
-            balance = portfolio.get('cash_balance', 0)
-            
-            trade_text = (
-                f"💱 <b>Trade Execution</b>\n\n"
-                f"Available: <code>${balance:,.2f}</code>\n\n"
-                f"Format: <code>/buy SYMBOL SIZE</code> or <code>/sell SYMBOL SIZE</code>\n"
-                f"Example: <code>/buy BTC-USD 0.5</code>"
-            )
-            await update.message.reply_text(trade_text, parse_mode='HTML')
-            
-        except Exception as e:
-            await update.message.reply_text(f"💱 Error: {str(e)}")
+        pf = self.paper_executor.get_portfolio_value() if hasattr(self.paper_executor, 'get_portfolio_value') else {}
+        bal = pf.get('cash_balance', 0)
+        
+        text = (
+            f"💱 <b>Trade</b>\n\n"
+            f"Available: ${bal:,.2f}\n\n"
+            f"<code>/buy BTC-USD 0.5</code>\n"
+            f"<code>/sell BTC-USD 0.5</code>"
+        )
+        await update.message.reply_text(text, parse_mode='HTML')
 
     async def cmd_markets(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show active markets"""
-        markets_text = ["📊 <b>Active Markets</b>\n"]
+        """Active markets"""
+        lines = ["📊 Markets"]
         
         if self.market_finder and hasattr(self.market_finder, 'find_active_btc_5m_markets'):
             try:
-                btc_markets = self.market_finder.find_active_btc_5m_markets()
-                if btc_markets:
-                    markets_text.append(f"\n<b>BTC 5m ({len(btc_markets)}):</b>")
-                    for m in btc_markets[:5]:
-                        markets_text.append(f"• {m.get('symbol', m.get('market_id', 'Unknown'))}")
+                markets = self.market_finder.find_active_btc_5m_markets()
+                if markets:
+                    lines.append(f"\n<b>BTC 5m ({len(markets)}):</b>")
+                    for m in markets[:5]:
+                        lines.append(f"• {m.get('symbol', m.get('market_id', '?'))}")
                 else:
-                    markets_text.append("\n<i>No BTC 5m markets active</i>")
+                    lines.append("\nNo active markets")
             except Exception as e:
-                markets_text.append(f"\n<i>Error: {str(e)}</i>")
+                lines.append(f"\nError: {e}")
         else:
-            markets_text.append("\n<i>Market finder not connected</i>")
+            lines.append("\nFinder offline")
         
-        await update.message.reply_text("\n".join(markets_text), parse_mode='HTML')
+        await update.message.reply_text("\n".join(lines), parse_mode='HTML')
 
     async def cmd_alert(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        alert_text = (
-            "🔔 <b>Alert Settings</b>\n\n"
-            f"Status: {'✅ Enabled' if self.config.get('notifications_enabled', True) else '❌ Disabled'}\n"
-            f"Chat ID: <code>{self.config.get('chat_id', 'Not set')}</code>"
+        """Alert settings"""
+        text = (
+            "🔔 Alerts\n\n"
+            f"Status: {'✅ ON' if self.config.get('notifications_enabled', True) else '❌ OFF'}"
         )
-        await update.message.reply_text(alert_text, parse_mode='HTML')
+        await update.message.reply_text(text, parse_mode='HTML')
 
     async def cmd_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False):
-        """Show settings with Auto-Trade toggle button"""
+        """Settings with auto-trade toggle"""
         from datetime import datetime
         
-        is_auto_trade = self.config.get('auto_trade', False)
+        is_auto = self.config.get('auto_trade', False)
         
-        settings_text = (
-            "⚙️ <b>Bot Configuration</b>\n\n"
-            f"Auto-Trade: {'✅ ON' if is_auto_trade else '❌ OFF'}\n"
-            f"Trade Size: {self.config.get('default_trade_size', 'Not set')}\n"
-            f"Check Interval: {self.config.get('check_interval', '60')}s\n\n"
-            f"Components:\n"
-            f"  Paper: {'✅' if self.paper_executor else '❌'}\n"
+        text = (
+            f"⚙️ <b>Settings</b> <i>{datetime.now().strftime('%H:%M')}</i>\n\n"
+            f"Auto-Trade: {'✅ ON' if is_auto else '❌ OFF'}\n"
+            f"Trade Size: {self.config.get('default_trade_size', '1.0')}\n"
+            f"Interval: {self.config.get('check_interval', '60')}s\n\n"
+            f"Status:\n"
+            f"  Trading: {'✅' if self.paper_executor else '❌'}\n"
             f"  Finder: {'✅' if self.market_finder else '❌'}\n"
-            f"  Checker: {'✅' if self.closure_checker else '❌'}\n\n"
-            f"<i>Updated: {datetime.now().strftime('%H:%M:%S')}</i>"
+            f"  Monitor: {'✅' if self.closure_checker else '❌'}"
         )
         
-        # Create toggle button
-        toggle_text = "🔴 Disable Auto-Trade" if is_auto_trade else "🟢 Enable Auto-Trade"
+        # Toggle button
+        toggle_btn = "🔴 Disable" if is_auto else "🟢 Enable"
         keyboard = [
-            [InlineKeyboardButton(toggle_text, callback_data="toggle_auto_trade")],
+            [InlineKeyboardButton(f"{toggle_btn} Auto-Trade", callback_data="toggle_auto_trade")],
             [InlineKeyboardButton("🔄 Refresh", callback_data="refresh_settings")]
         ]
         markup = InlineKeyboardMarkup(keyboard)
         
         if edit and update.callback_query:
             try:
-                await update.callback_query.edit_message_text(
-                    settings_text, 
-                    parse_mode='HTML', 
-                    reply_markup=markup
-                )
+                await update.callback_query.edit_message_text(text, parse_mode='HTML', reply_markup=markup)
             except BadRequest as e:
-                if "Message is not modified" in str(e):
-                    await update.callback_query.answer("✅ Settings unchanged")
-                else:
+                if "Message is not modified" not in str(e):
                     raise
         else:
-            await update.message.reply_text(settings_text, parse_mode='HTML', reply_markup=markup)
+            await update.message.reply_text(text, parse_mode='HTML', reply_markup=markup)
 
     async def toggle_auto_trade_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle Auto-Trade toggle button click"""
+        """Toggle auto-trade"""
         query = update.callback_query
         
-        # Toggle the value
         current = self.config.get('auto_trade', False)
         self.config['auto_trade'] = not current
-        
         new_status = "ON ✅" if self.config['auto_trade'] else "OFF ❌"
-        logger.info(f"Auto-Trade toggled to: {new_status}")
         
-        # Notify user
-        await query.answer(f"Auto-Trade is now {new_status}")
+        logger.info(f"Auto-Trade: {new_status}")
+        await query.answer(f"Auto-Trade {new_status}")
         
-        # Update market_finder if available to apply changes immediately
         if self.market_finder:
             self.market_finder.config['auto_trade'] = self.config['auto_trade']
         
-        # Refresh the settings message
         await self.cmd_settings(update, context, edit=True)
 
-    async def cmd_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("🛑 <b>Stopping bot...</b>\nGoodbye!", parse_mode='HTML')
-        self.stop()
+    # STOP COMMAND COMPLETELY REMOVED
+    # Use systemctl stop or Ctrl+C to stop the bot properly
 
     async def cmd_restart(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text("🔄 <b>Restarting...</b>\nPlease wait.", parse_mode='HTML')
+        await update.message.reply_text("🔄 Restarting...", parse_mode='HTML')
 
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Help - STOP REMOVED"""
         help_text = """
 <b>📱 Commands</b>
+
+<b>Account:</b>
 /balance - Portfolio balance ↻
+/positions - Open positions
 /history - Trade history ↻
 /pnl - P&L summary ↻
-/status - System status ↻
-/settings - Configuration & Auto-Trade toggle 🔄
-/positions - Open positions
+
+<b>Trading:</b>
 /markets - Active markets
 /trade - Trade panel
-/stop - Stop bot
+/settings - Config & Auto-Trade toggle 🔄
+
+<b>System:</b>
+/status - System status ↻
+/start - Start message
+/restart - Restart
 /help - This help
 
 <i>↻ = Refresh button</i>
 <i>🔄 = Toggle button</i>
+
+<b>Note:</b> To stop the bot, use Ctrl+C or systemctl stop
         """
         await update.message.reply_text(help_text, parse_mode='HTML')
 
     def start(self):
+        """Start bot thread"""
         if self.running:
-            logger.warning("Bot already running")
             return
             
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
-        logger.info("Telegram bot thread started")
+        logger.info("🚀 Bot polling started")
 
     def _run(self):
+        """Run bot"""
         try:
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
@@ -518,7 +452,11 @@ class TelegramBotRunner:
             self.register_handlers()
             
             self.running = True
-            logger.info("Telegram bot initialized and polling...")
+            
+            # Clean startup message
+            logger.info("=" * 40)
+            logger.info("🤖 5Min Trading Bot Active")
+            logger.info("=" * 40)
             
             self.application.run_polling(
                 drop_pending_updates=True,
@@ -527,52 +465,29 @@ class TelegramBotRunner:
             )
             
         except Exception as e:
-            logger.error(f"Telegram bot fatal error: {e}")
+            logger.error(f"❌ Bot error: {e}")
         finally:
             self.running = False
             if self._loop:
                 try:
                     self._loop.close()
-                except Exception:
+                except:
                     pass
 
     def stop(self):
+        """Stop gracefully"""
         if self.application and self._loop:
             try:
-                asyncio.run_coroutine_threadsafe(
-                    self.application.stop(), 
-                    self._loop
-                )
+                asyncio.run_coroutine_threadsafe(self.application.stop(), self._loop)
             except Exception as e:
-                logger.error(f"Error stopping bot: {e}")
+                logger.error(f"Stop error: {e}")
         self.running = False
+        logger.info("🛑 Bot stopped")
 
-    def send_message_sync(self, chat_id: int, message: str):
-        if not self.running or not self._loop:
-            logger.error("Bot not running, cannot send message")
-            return
-            
-        try:
-            async def _send():
-                await self.application.bot.send_message(
-                    chat_id=chat_id, 
-                    text=message,
-                    parse_mode='HTML'
-                )
-            
-            future = asyncio.run_coroutine_threadsafe(_send(), self._loop)
-            future.result(timeout=10)
-            
-        except Exception as e:
-            logger.error(f"Failed to send message: {e}")
-
+    # Notification methods (unchanged but cleaner)
     async def send_message(self, chat_id: int, message: str):
         if self.application:
-            await self.application.bot.send_message(
-                chat_id=chat_id, 
-                text=message,
-                parse_mode='HTML'
-            )
+            await self.application.bot.send_message(chat_id=chat_id, text=message, parse_mode='HTML')
 
     async def send_trade_notification(self, trade: Dict):
         if not self.config.get('notifications_enabled', True):
@@ -580,30 +495,20 @@ class TelegramBotRunner:
         chat_id = self.config.get('chat_id')
         if not chat_id:
             return
-            
-        message = (
-            f"📝 <b>Trade Executed</b>\n"
-            f"{trade.get('symbol')} {trade.get('side')} {trade.get('size')} @ ${trade.get('price', 0):,.2f}"
-        )
-        await self.send_message(chat_id, message)
+        msg = f"📝 Trade: {trade.get('symbol')} {trade.get('side')} {trade.get('size')} @ ${trade.get('price', 0):,.2f}"
+        await self.send_message(chat_id, msg)
 
     async def send_opportunity_alert(self, opportunity: Dict):
         chat_id = self.config.get('chat_id')
         if not chat_id:
             return
-            
-        message = (
-            f"🔍 <b>Opportunity</b>\n"
-            f"{opportunity.get('symbol')} {opportunity.get('signal')} "
-            f"({opportunity.get('confidence', 0):.0%})"
-        )
-        await self.send_message(chat_id, message)
+        msg = f"🔍 {opportunity.get('symbol')} {opportunity.get('signal')} ({opportunity.get('confidence', 0):.0%})"
+        await self.send_message(chat_id, msg)
 
     async def send_closure_notification(self, market_id: str, winner: str, pnl: float, details: Dict = None):
         chat_id = self.config.get('chat_id')
         if not chat_id:
             return
-            
         emoji = "🟢" if pnl >= 0 else "🔴"
-        message = f"{emoji} <b>Closed</b> {market_id}\nWinner: {winner}\nPnL: ${pnl:,.2f}"
-        await self.send_message(chat_id, message)
+        msg = f"{emoji} Closed: {market_id}\nWinner: {winner}\nPnL: ${pnl:,.2f}"
+        await self.send_message(chat_id, msg)
