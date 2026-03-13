@@ -10,18 +10,22 @@ class PaperExecutor:
     def __init__(self, 
                  initial_balance: float = 10000.0,
                  paper_clob: Any = None,
+                 paper_store: Any = None,
                  db=None,
                  notifier=None,
-                 config: Optional[Dict] = None):
+                 config: Optional[Dict] = None,
+                 **kwargs):
         """
         Initialize Paper Trading Executor
         
         Args:
             initial_balance: Starting balance for paper trading
             paper_clob: Paper Central Limit Order Book instance
+            paper_store: Paper storage/persistence layer
             db: Database instance for trade logging
             notifier: Notification service (Telegram, etc.)
             config: Additional configuration dict
+            **kwargs: Catch any other keyword arguments passed
         """
         self.balance = float(initial_balance)
         self.initial_balance = float(initial_balance)
@@ -31,14 +35,21 @@ class PaperExecutor:
         self.db = db
         self.config = config or {}
         
-        # Store paper_clob reference
+        # Store injected dependencies
         self.paper_clob = paper_clob
+        self.paper_store = paper_store
+        
+        # Store any extra kwargs safely
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+            logger.debug(f"Stored extra param: {key}")
         
         # Lazy import for notifier to avoid circular imports
         self._notifier = notifier
         self._telegram_notifier = None
         
-        logger.info(f"PaperExecutor initialized | Balance: ${initial_balance} | CLOB: {paper_clob is not None}")
+        logger.info(f"PaperExecutor initialized | Balance: ${initial_balance} | "
+                   f"CLOB: {paper_clob is not None} | Store: {paper_store is not None}")
 
     @property
     def notifier(self):
@@ -114,6 +125,13 @@ class PaperExecutor:
         }
         self.trade_history.append(trade_record)
         
+        # Save to paper_store if available
+        if self.paper_store and hasattr(self.paper_store, 'save_trade'):
+            try:
+                self.paper_store.save_trade(trade_record)
+            except Exception as e:
+                logger.error(f"Failed to save trade to paper_store: {e}")
+        
         # Save to DB if available
         if self.db:
             try:
@@ -155,12 +173,28 @@ class PaperExecutor:
                 pos["avg_entry_price"] = 0
                 pos["total_cost"] = 0
 
+        # Persist to paper_store if available
+        if self.paper_store and hasattr(self.paper_store, 'update_position'):
+            try:
+                self.paper_store.update_position(symbol, self.positions[symbol])
+            except Exception as e:
+                logger.error(f"Failed to update position in store: {e}")
+
     def _get_market_price(self, symbol: str) -> float:
         """Get current market price - uses paper_clob if available"""
         if self.paper_clob and hasattr(self.paper_clob, 'get_price'):
-            return float(self.paper_clob.get_price(symbol))
+            try:
+                return float(self.paper_clob.get_price(symbol))
+            except Exception as e:
+                logger.error(f"Error getting price from CLOB: {e}")
         
-        # Fallback - you might want to integrate with your market data feed here
+        # Fallback to paper_store if it has price data
+        if self.paper_store and hasattr(self.paper_store, 'get_price'):
+            try:
+                return float(self.paper_store.get_price(symbol))
+            except Exception as e:
+                logger.error(f"Error getting price from store: {e}")
+        
         logger.warning(f"No price source available for {symbol}, using 0")
         return 0.0
 
@@ -179,20 +213,30 @@ class PaperExecutor:
                 f"Total: ${trade['total_value']:.2f}\n"
                 f"Balance: ${trade['balance_after']:.2f}"
             )
-            self.notifier.send_message(message)
+            
+            if hasattr(self.notifier, 'send_message'):
+                self.notifier.send_message(message)
+            elif hasattr(self.notifier, 'send_trade_notification'):
+                self.notifier.send_trade_notification(trade)
         except Exception as e:
             logger.error(f"Failed to send trade notification: {e}")
 
     def get_position(self, symbol: str) -> Dict:
         """Get current position for a symbol"""
+        # Check paper_store first if available
+        if self.paper_store and hasattr(self.paper_store, 'get_position'):
+            try:
+                stored_pos = self.paper_store.get_position(symbol)
+                if stored_pos:
+                    return stored_pos
+            except Exception as e:
+                logger.error(f"Error reading position from store: {e}")
+        
         return self.positions.get(symbol, {"quantity": 0, "avg_entry_price": 0})
 
     def get_portfolio_value(self, market_prices: Optional[Dict[str, float]] = None) -> Dict:
         """
         Calculate total portfolio value
-        
-        Returns:
-            Dict with balance, positions_value, total_value, and unrealized_pnl
         """
         positions_value = 0.0
         unrealized_pnl = 0.0
@@ -220,7 +264,41 @@ class PaperExecutor:
 
     def get_trade_history(self, limit: int = 100) -> List[Dict]:
         """Get recent trade history"""
+        # Try to get from paper_store if available
+        if self.paper_store and hasattr(self.paper_store, 'get_trade_history'):
+            try:
+                return self.paper_store.get_trade_history(limit)
+            except Exception as e:
+                logger.error(f"Error reading history from store: {e}")
+        
         return self.trade_history[-limit:]
+
+    def load_state(self):
+        """Load state from paper_store if available"""
+        if self.paper_store and hasattr(self.paper_store, 'load_state'):
+            try:
+                state = self.paper_store.load_state()
+                if state:
+                    self.balance = state.get('balance', self.initial_balance)
+                    self.positions = state.get('positions', {})
+                    self.trade_history = state.get('trade_history', [])
+                    logger.info("Loaded state from paper_store")
+            except Exception as e:
+                logger.error(f"Failed to load state: {e}")
+
+    def save_state(self):
+        """Save current state to paper_store"""
+        if self.paper_store and hasattr(self.paper_store, 'save_state'):
+            try:
+                state = {
+                    'balance': self.balance,
+                    'positions': self.positions,
+                    'trade_history': self.trade_history,
+                    'timestamp': datetime.now().isoformat()
+                }
+                self.paper_store.save_state(state)
+            except Exception as e:
+                logger.error(f"Failed to save state: {e}")
 
     def reset(self):
         """Reset paper trading account"""
@@ -228,4 +306,12 @@ class PaperExecutor:
         self.positions = {}
         self.trade_history = []
         self.open_orders = []
+        
+        # Clear paper_store if available
+        if self.paper_store and hasattr(self.paper_store, 'reset'):
+            try:
+                self.paper_store.reset()
+            except Exception as e:
+                logger.error(f"Failed to reset store: {e}")
+                
         logger.info("PaperExecutor reset to initial state")
