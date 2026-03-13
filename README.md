@@ -1,16 +1,7 @@
-<div align="center">
-
-```
-███████╗    ███╗   ███╗██╗███╗   ██╗
-██╔════╝    ████╗ ████║██║████╗  ██║
-███████╗    ██╔████╔██║██║██╔██╗ ██║
-╚════██║    ██║╚██╔╝██║██║██║╚██╗██║
-███████║    ██║ ╚═╝ ██║██║██║ ╚████║
-╚══════╝    ╚═╝     ╚═╝╚═╝╚═╝  ╚═══╝
-```
-
 ### Automated BTC 5-Minute Prediction Market Trader on Polymarket
 
+
+<div align="center">
 [![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
 [![Polymarket](https://img.shields.io/badge/Polymarket-CLOB_API-00C2FF?style=for-the-badge)](https://polymarket.com)
 [![Telegram](https://img.shields.io/badge/Telegram-Bot_Dashboard-26A5E4?style=for-the-badge&logo=telegram&logoColor=white)](https://telegram.org)
