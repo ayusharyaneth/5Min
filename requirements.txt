@@ -1,8 +1,29 @@
-python-dotenv==1.0.0
-requests==2.31.0
-websocket-client==1.6.4
-eth-account==0.10.0
-web3==6.15.1
-pydantic==2.5.3
-python-dateutil==2.8.2
-python-telegram-bot==20.7
+# Core
+python-telegram-bot>=20.0
+requests>=2.28.0
+python-dateutil>=2.8.2
+pytz>=2023.3
+
+# Data & Trading
+pandas>=1.5.0
+numpy>=1.24.0
+
+# Database
+sqlite3  # Built-in, but listed for clarity
+
+# Async
+asyncio>=3.4.3
+aiohttp>=3.8.0
+
+# Polymarket (Live Trading) - Optional
+# py-clob-client>=0.0.1
+# web3>=6.0.0
+# eth-account>=0.8.0
+
+# Utils
+python-dotenv>=1.0.0
+pydantic>=2.0.0
+typing-extensions>=4.5.0
+
+# Logging & Monitoring
+colorama>=0.4.6
